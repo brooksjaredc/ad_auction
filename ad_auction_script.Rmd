@@ -1,0 +1,169 @@
+---
+title: "Thompson Sampling Ad Auction"
+author: "Jared Brooks"
+date: "9/28/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Skills Practice
+
+This is for practicing some DS skills. I am following a post from Count Bayesie here: https://www.countbayesie.com/blog/2020/9/26/learn-thompson-sampling-by-building-an-ad-auction
+
+## Data Setup
+
+First I'm just setting up example data to play with
+
+```{r}
+ad_info <- data.frame("advertiser" = c("buymystuff.com", "eyespyonyou.com", "commodityfetishismllc.com"),
+                      "bid" = c(0.7, 0.5, 0.4), "views" = c(2000, 0,0), 
+                      "clicks" = c(47,0,0), "ctr" = c(0.025, 0.012, 0.045))
+library(knitr)
+kable(ad_info)
+```
+
+Given the previous views and clicks for "buymystuff.com" we can look at a likelihood estimate plot for its click-through-rate
+
+```{r}
+library(ggplot2)
+ggplot() + stat_function(fun = function(x) dbeta(x, 47,1953), color="black") + xlim(0, 0.04)
+```
+
+Now we pretend like we don't know the CTRs for the other two ad bidders, but that we do have a lot of information about how campaigns perform in general. We generate this using a beta distribution assuming an average CTR of 0.02 from 500 campaigns.
+
+```{r}
+past_ctrs <- rbeta(500, 2, 98, ncp = 0)
+
+prior_est <- MASS::fitdistr(past_ctrs, dbeta,
+#choosing these shape parameters because our mean(past_ctrs) is about 0.02                    
+                            start = list(shape1 = 2, 
+                                         shape2 = 98))
+alpha_prior <- prior_est$estimate[1]
+beta_prior <- prior_est$estimate[2]
+
+ggplot() + geom_histogram(aes(past_ctrs), binwidth = .002) + stat_function(fun = function(x) dbeta(x, alpha_prior, beta_prior), color = "red",size = 1) + xlab("CTR")
+```
+
+Now, given the CTR from one bidder and using a beta distribution on the previous campaigns to estimate the CTRs from the other two bidders, and including their bids, we can plot the distributions of expected values
+
+```{r}
+ggplot() + stat_function(fun = function(x) dbeta(x/ad_info$bid[1], ad_info$clicks[1],(ad_info$views[1]-ad_info$clicks[1])), color="red", size=1) + stat_function(fun = function(x) dbeta(x/ad_info$bid[2], alpha_prior, beta_prior), color="green", size=1) + stat_function(fun = function(x) dbeta(x/ad_info$bid[3], alpha_prior, beta_prior), color="blue", size=1) + xlim(0,0.03) + ggtitle("Distribution of Expected Values")
+```
+
+## Sampling Frequency for who wins the bids
+
+We now have enough to make estimates of the expected values to see who will win the bids by sampling from our distributions.
+
+```{r}
+#number of samples we want
+N <- 10000
+#BuyMyStuff.com
+ad_A <- ad_info$bid[1]*rbeta(N,
+                             ad_info$clicks[1] + alpha_prior,
+                             (ad_info$views[1]-ad_info$clicks[1]) +
+                             beta_prior)
+
+#EyeSpyOnYou.com
+ad_B <- ad_info$bid[2]*rbeta(N, 
+                             ad_info$clicks[2] + alpha_prior,
+                             (ad_info$views[2]-ad_info$clicks[2]) + 
+                             beta_prior)
+
+#CommodityFetishismLLC.com
+ad_C <- ad_info$bid[3]*rbeta(N, 
+                             ad_info$clicks[3] + alpha_prior,
+                             (ad_info$views[3]-ad_info$clicks[3]) +
+                             beta_prior)
+```
+
+Let's compare the sampling frequency of A and B
+
+```{r}
+ggplot() + geom_histogram(aes(ad_A-ad_B), bins = 12) + geom_vline(xintercept = 0) + ggtitle("Sampling Difference for EV_A and EV_B")
+```
+
+Let's compare B and C against A to see their probably of getting picked over A
+
+```{r}
+ad_info$p_gt_A <- c(0.5, sum(ad_A < ad_B)/N, sum(ad_A < ad_C)/N)
+```
+
+Ad A gets 0.5 as it is being compared against itself.
+
+Now lets normalize these to get weighted probabilities that add to 1
+
+```{r}
+ad_info$weighted_p_gt_A <- ad_info$p_gt_A/(sum(ad_info$p_gt_A))
+```
+
+Now we sample from these calculated probabilites to see how many new views each ad gets, and use our "known" CTRs to estimate the new clicks for each add
+
+```{r, message=FALSE}
+library(dplyr)
+winners_df <- sample(ad_info$advertiser,
+                     prob = ad_info$weighted_p_gt_A,
+                     replace = TRUE,
+                     size=500) %>%  
+  table() %>%  
+  as.data.frame()
+
+ad_info$new_views <- winners_df$Freq
+ad_info$new_clicks <- rbinom(c(1,1,1),ad_info$new_views,ad_info$ctr)
+```
+
+Now lets look at a table of the results
+
+```{r}
+kable(ad_info[,c(1,2,3,4,8,9)])
+```
+
+And we can see the updated distributions
+
+```{r}
+ggplot() + 
+  stat_function(fun = function(x) dbeta(x/ad_info$bid[1], ad_info$clicks[1] + ad_info$new_clicks[1], (ad_info$views[1]-ad_info$clicks[1]) + (ad_info$new_views[1]-ad_info$new_clicks[1])), color="red", size=1) + 
+  
+  stat_function(fun = function(x) dbeta(x/ad_info$bid[2], alpha_prior + ad_info$new_clicks[2], beta_prior + (ad_info$new_views[2]-ad_info$new_clicks[2])), color="green", size=1) + 
+  
+  stat_function(fun = function(x) dbeta(x/ad_info$bid[3], alpha_prior + ad_info$new_clicks[3], beta_prior + (ad_info$new_views[3]-ad_info$new_clicks[3])), color="blue", size=1) + xlim(0,0.03) + 
+  
+  ggtitle("Distribution of Expected Values")
+
+```
+
+Now we can use this to calculate and look at new sampling probabilities
+
+```{r}
+#number of samples we want
+N <- 10000
+#BuyMyStuff.com
+ad_A <- ad_info$bid[1]*rbeta(N,
+                             ad_info$clicks[1] + ad_info$new_clicks[1] + alpha_prior,
+                             (ad_info$views[1]-ad_info$clicks[1]) + (ad_info$new_views[1]-ad_info$new_clicks[1]) +
+                             beta_prior)
+
+#EyeSpyOnYou.com
+ad_B <- ad_info$bid[2]*rbeta(N, 
+                             ad_info$clicks[2] + ad_info$new_clicks[2] + alpha_prior,
+                             (ad_info$views[2]-ad_info$clicks[2]) + (ad_info$new_views[2]-ad_info$new_clicks[2]) +
+                             beta_prior)
+
+#CommodityFetishismLLC.com
+ad_C <- ad_info$bid[3]*rbeta(N, 
+                             ad_info$clicks[3] + ad_info$new_clicks[3] + alpha_prior,
+                             (ad_info$views[3]-ad_info$clicks[3]) + (ad_info$new_views[3]-ad_info$new_clicks[3]) +
+                             beta_prior)
+
+ad_info$p_gt_A <- c(0.5, sum(ad_A < ad_B)/N, sum(ad_A < ad_C)/N)
+ad_info$weighted_p_gt_A <- ad_info$p_gt_A/(sum(ad_info$p_gt_A))
+
+kable(ad_info[,c(1,6,7)])
+```
+
+
+## Continuous updating
+
+
